@@ -1,0 +1,126 @@
+diff --git a/python/sglang/srt/entrypoints/openai/protocol.py b/python/sglang/srt/entrypoints/openai/protocol.py
+index ae46c5c..191245a 100644
+--- a/python/sglang/srt/entrypoints/openai/protocol.py
++++ b/python/sglang/srt/entrypoints/openai/protocol.py
+@@ -1440,6 +1440,26 @@ class ChatCompletionRequest(PDRoutingFields):
+                 self.response_format.model_dump(by_alias=True)
+             )
+ 
++        # A forced tool call (tool_choice "required" / named) wins over
++        # response_format: the reply is a tool call, never free JSON text, so the
++        # response_format grammar has nothing to constrain. Moonshot and OpenAI
++        # accept this combination; stock sglang 400s it. The renderer still shows
++        # response_format to the model (prompt_tokens unchanged). An explicit
++        # regex / ebnf from the caller still conflicts and is rejected below.
++        if (
++            tool_call_constraint
++            and tool_call_constraint[0] != "full_assistant_ebnf"
++            and self.response_format is not None
++            and not self.regex
++            and not self.ebnf
++            and (
++                self.tool_choice == "required"
++                or isinstance(self.tool_choice, ToolChoice)
++            )
++        ):
++            sampling_params.pop("json_schema", None)
++            sampling_params.pop("structural_tag", None)
++
+         # Check if there are already existing output constraints
+         has_existing_constraints = (
+             sampling_params.get("regex")
+diff --git a/python/sglang/srt/entrypoints/openai/serving_chat.py b/python/sglang/srt/entrypoints/openai/serving_chat.py
+index 98c1f48..41bccb0 100644
+--- a/python/sglang/srt/entrypoints/openai/serving_chat.py
++++ b/python/sglang/srt/entrypoints/openai/serving_chat.py
+@@ -1123,7 +1123,11 @@ class OpenAIServingChat(OpenAIServingBase):
+                     yield chunk
+ 
+             # Send any remaining tool call arguments when generation finishes
+-            if finish_reason_type is not None and index in parser_dict:
++            if (
++                finish_reason_type is not None
++                and index in parser_dict
++                and not self._drop_tool_calls(request)
++            ):
+                 parser = parser_dict[index]
+                 remaining_chunk = self._check_for_unstreamed_tool_args(
+                     parser,
+@@ -1206,7 +1210,14 @@ class OpenAIServingChat(OpenAIServingBase):
+             # With no tools declared, tool_choice only holds its default and limits nothing.
+             detector = FunctionCallParser.ToolCallParserEnum[self.tool_call_parser]
+             return detector.parses_without_tools()
+-        return request.tool_choice != "none"
++        # tool_choice="none" included: a call the model writes anyway must be
++        # consumed by the parser, not leaked as raw template text (#44714).
++        return True
++
++    @staticmethod
++    def _drop_tool_calls(request: ChatCompletionRequest) -> bool:
++        """``tool_choice="none"``: parse tool calls but never return them."""
++        return request.tool_choice == "none"
+ 
+     @staticmethod
+     def _answer_started(reasoning_parser: ReasoningParser | None) -> bool:
+@@ -1246,6 +1257,26 @@ class OpenAIServingChat(OpenAIServingBase):
+         if media_error:
+             return media_error
+ 
++        # An assistant tool call in the history without function.name would
++        # otherwise fail deep in template rendering; return 400 instead, as
++        # Moonshot's API does.
++        for mi, msg in enumerate(request.messages):
++            calls = getattr(msg, "tool_calls", None)
++            if calls is None and isinstance(msg, dict):
++                calls = msg.get("tool_calls")
++            for ci, call in enumerate(calls or []):
++                fn = getattr(call, "function", None)
++                if fn is None and isinstance(call, dict):
++                    fn = call.get("function")
++                name = getattr(fn, "name", None)
++                if name is None and isinstance(fn, dict):
++                    name = fn.get("name")
++                if not isinstance(name, str) or not name:
++                    return (
++                        f"messages[{mi}].tool_calls[{ci}].function.name is "
++                        "required and must be a non-empty string."
++                    )
++
+         if self.chat_encoding_spec == "kimi_k3":
+             # thinking stays a plain dict on the request (other models' templates
+             # read it as one); the K3 surface enforces the K3 shape.
+@@ -2087,6 +2118,14 @@ class OpenAIServingChat(OpenAIServingBase):
+             if tag is not None:
+                 tool_call_constraint = ("structural_tag", tag)
+ 
++        if (
++            effective_tools
++            and request.tool_choice == "none"
++            and self.tool_call_parser
++            and not glm_constraint
++        ):
++            request.skip_special_tokens = False
++
+         # When input_ids are provided, skip template tokenization entirely;
+         # only stop tokens and tool_call_constraint are needed.
+         if request.input_ids is not None:
+@@ -2944,6 +2983,10 @@ class OpenAIServingChat(OpenAIServingBase):
+                 sglext_routed = next(
+                     (v for v in routed_experts.values() if v is not None), None
+                 )
++                if self._drop_tool_calls(request):
++                    tool_calls = None
++                    if finish_reason and finish_reason.get("type") == "tool_calls":
++                        finish_reason["type"] = "stop"
+ 
+             sglext_cached_tokens_details = None
+             if request.return_cached_tokens_details and cached_tokens_details:
+@@ -4158,6 +4201,8 @@ class OpenAIServingChat(OpenAIServingBase):
+             yield f"data: {chunk.model_dump_json()}\n\n"
+ 
+         # Yield tool calls
++        if self._drop_tool_calls(request):
++            calls = []
+         history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
+         for call_item in calls:
+             # Mark that this choice has tool calls

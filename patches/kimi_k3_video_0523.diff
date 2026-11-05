@@ -1,0 +1,972 @@
+diff --git a/python/sglang/srt/entrypoints/openai/serving_chat.py b/python/sglang/srt/entrypoints/openai/serving_chat.py
+index 6476d52..90414de 100644
+--- a/python/sglang/srt/entrypoints/openai/serving_chat.py
++++ b/python/sglang/srt/entrypoints/openai/serving_chat.py
+@@ -242,6 +242,24 @@ def _extract_max_dynamic_patch(request: ChatCompletionRequest):
+     return img_max_dynamic_patch, vid_max_dynamic_patch
+ 
+ 
++def _kimi_k3_media_order(request: ChatCompletionRequest) -> list[str]:
++    """Image/video part order, matching process_content_for_template_format."""
++    order = []
++    for message in request.messages or []:
++        content = getattr(message, "content", None)
++        if not isinstance(content, list):
++            continue
++        for part in content:
++            part_type = (
++                part.get("type") if isinstance(part, dict) else getattr(part, "type", None)
++            )
++            if part_type in ("image_url", "input_image"):
++                order.append("image")
++            elif part_type == "video_url":
++                order.append("video")
++    return order
++
++
+ KIMI_K3_IMAGE_PLACEHOLDER = "<|kimi_image_placeholder|>"
+ KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED = "<| kimi_image_placeholder |>"
+ 
+@@ -678,6 +696,14 @@ class OpenAIServingChat(OpenAIServingBase):
+                             image = {"url": image, "detail": part.get("detail")}
+                         parts.append({"type": "image_url", "image_url": image})
+                         image_count += 1
++                    elif part_type == "video_url":
++                        # K3's encoder only renders image parts. Each video
++                        # gets one structural media placeholder here; the K3
++                        # processor expands it into timestamped video chunks.
++                        # The video itself reaches the processor through
++                        # video_data (collected from the original request).
++                        parts.append({"type": "image_url", "image_url": {}})
++                        image_count += 1
+                 message["content"] = parts
+             elif isinstance(content, str):
+                 message["content"] = neutralize_kimi_k3_image_placeholder(content)
+@@ -2072,6 +2098,11 @@ class OpenAIServingChat(OpenAIServingBase):
+                         audio_data,
+                         modalities,
+                     )
++                if self.chat_encoding_spec == "kimi_k3" and video_data:
++                    # K3 renders images and videos through the same media
++                    # placeholder; record their prompt order so the processor
++                    # can tell which placeholder is which.
++                    modalities[:] = _kimi_k3_media_order(request)
+         elif self.chat_encoding_spec is not None:
+             # dsv32 encoding path
+             messages = copy.deepcopy(messages)
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index 10eee80..32f66fa 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -2120,6 +2120,20 @@ class Envs:
+     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
+     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
+     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
++    # Kimi-K3 video input (K2.5-style temporal chunks), see
++    # multimodal/processors/kimi_k3_video.py. Off restores the image-only 400.
++    SGLANG_KIMI_K3_VIDEO_ENABLE = EnvBool(True)
++    # Prompt framing: moonshot (matches Moonshot API) | k25 | sized | ts_in_header.
++    SGLANG_KIMI_K3_VIDEO_PROMPT_FORMAT = EnvStr("moonshot")
++    # in_patch_limit_video use: frames (Moonshot: caps frame count) | chunk | video.
++    SGLANG_KIMI_K3_VIDEO_PATCH_BUDGET = EnvStr("frames")
++    # Per-request guards, checked before decoding (0 disables a limit).
++    SGLANG_KIMI_K3_VIDEO_MAX_DURATION_S = EnvFloat(60.0)
++    SGLANG_KIMI_K3_VIDEO_MAX_FRAMES = EnvInt(512)
++    SGLANG_KIMI_K3_VIDEO_MAX_TOKENS = EnvInt(65536)
++    # Concurrent video decodes per tokenizer process, and decoder threads each.
++    SGLANG_KIMI_K3_VIDEO_MAX_CONCURRENCY = EnvInt(2)
++    SGLANG_KIMI_K3_VIDEO_DECODE_THREADS = EnvInt(4)
+ 
+     # ===================================================================
+     # Symmetric memory
+diff --git a/python/sglang/srt/models/kimi_k3_vl.py b/python/sglang/srt/models/kimi_k3_vl.py
+index e77a867..bb93ade 100644
+--- a/python/sglang/srt/models/kimi_k3_vl.py
++++ b/python/sglang/srt/models/kimi_k3_vl.py
+@@ -223,9 +223,11 @@ class Learnable2DInterpPosEmbDividedFixed(nn.Module):
+             if t == 1:
+                 pos_emb_3d = pos_emb_2d
+             else:
++                # time_weight is a non-persistent buffer; it may not follow
++                # the weights' device on every load path.
+                 pos_emb_3d = pos_emb_2d.unsqueeze(0).repeat(t, 1, 1) + self.time_weight[
+                     0:t
+-                ].to(pos_emb_2d.dtype)
++                ].to(device=pos_emb_2d.device, dtype=pos_emb_2d.dtype)
+ 
+             pos_embs.append(pos_emb_3d.reshape(-1, pos_emb_3d.shape[-1]))
+ 
+diff --git a/python/sglang/srt/multimodal/processors/kimi_k3.py b/python/sglang/srt/multimodal/processors/kimi_k3.py
+index dbd3df5..dd2083d 100644
+--- a/python/sglang/srt/multimodal/processors/kimi_k3.py
++++ b/python/sglang/srt/multimodal/processors/kimi_k3.py
+@@ -8,6 +8,7 @@ images onto the checkpoint-configured background
+ at load time.
+ """
+ 
++import asyncio
+ import functools
+ import math
+ import re
+@@ -25,9 +26,11 @@ from sglang.srt.managers.schedule_batch import (
+ )
+ from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+ from sglang.srt.multimodal.cache import resolve_multimodal_item_hash, snapshot_media
++from sglang.srt.multimodal.cache.identity import build_artifact_key
+ from sglang.srt.multimodal.kimi_k3_image_processing import (
+     DEFERRED_PREPROCESSING_KEY,
+     KimiK3DeferredPreprocessing,
++    normalization_tensors,
+ )
+ from sglang.srt.multimodal.kimi_k3_image_processing import (
+     fill_transparent_bg as _fill_transparent_bg,
+@@ -56,6 +59,19 @@ from sglang.srt.multimodal.processors.kimi_common import (
+     kimi_image_identity,
+     unwrap_kimi_images,
+ )
++from sglang.srt.multimodal.processors.kimi_k3_video import (
++    MEDIA_END,
++    KimiK3OpenedVideo,
++    KimiK3VideoConfig,
++    KimiK3VideoLimits,
++    check_video_limits,
++    chunk_content_digest,
++    chunk_prompt_parts,
++    plan_video,
++    preprocess_video,
++    resolve_visual_order,
++    video_executor,
++)
+ from sglang.srt.multimodal.processors.kimi_k25 import (
+     KimiGPUProcessorWrapper,
+     _get_image_dimensions,
+@@ -408,6 +424,16 @@ class KimiK3ImageProcessor(
+         )
+         super().__init__(hf_config, server_args, processor, *args, **kwargs)
+         self.mm_tokens = mm_tokens
++        self.video_config = KimiK3VideoConfig.from_media_proc_cfg(
++            dict(_processor.media_processor.media_proc_cfg),
++            prompt_format=envs.SGLANG_KIMI_K3_VIDEO_PROMPT_FORMAT.get(),
++            patch_budget=envs.SGLANG_KIMI_K3_VIDEO_PATCH_BUDGET.get(),
++        )
++        self.video_limits = KimiK3VideoLimits(
++            max_duration_s=envs.SGLANG_KIMI_K3_VIDEO_MAX_DURATION_S.get(),
++            max_sampled_frames=envs.SGLANG_KIMI_K3_VIDEO_MAX_FRAMES.get(),
++            max_video_tokens=envs.SGLANG_KIMI_K3_VIDEO_MAX_TOKENS.get(),
++        )
+ 
+     def _should_defer_gpu_preprocessing(self, images) -> bool:
+         """
+@@ -716,6 +742,261 @@ class KimiK3ImageProcessor(
+             im_token_id=self.mm_tokens.image_token_id,
+         )
+ 
++    # ------------------------------------------------------------------
++    # Video (K2.5-style temporal chunks); see kimi_k3_video.py
++    # ------------------------------------------------------------------
++
++    def _preprocess_images_for_video_request(self, loaded_images, device):
++        """Same math as the image path (_gpu_call), on ``device``."""
++        config = self._processor.preprocess_config
++        images = unwrap_kimi_images(loaded_images)
++        sizes = [_get_image_dimensions(image) for image in images]
++        resize_configs = [
++            navit_resize_config(
++                width,
++                height,
++                config.patch_size,
++                config.merge_kernel_size,
++                config.in_patch_limit,
++                config.patch_limit_on_one_side,
++                config.fixed_output_tokens,
++            )
++            for width, height in sizes
++        ]
++        image_scale, image_bias = normalization_tensors(
++            list(config.image_mean), list(config.image_std), device
++        )
++        with torch.inference_mode():
++            pixel_values, grid_thws = _gpu_preprocess_images(
++                images,
++                resize_configs,
++                image_scale,
++                image_bias,
++                config.patch_size,
++                to_chw=lambda image: to_chw_uint8(image, device=device),
++                post_resize=lambda x: _fill_transparent_bg(
++                    x, config.transparent_bg_config
++                ),
++            )
++        grids = [tuple(int(v) for v in grid) for grid in grid_thws.tolist()]
++        features = list(pixel_values.split([math.prod(grid) for grid in grids]))
++        return features, sizes, resize_configs, grids
++
++    async def _process_mm_data_with_video(
++        self, image_data, video_data, input_text, request_obj
++    ) -> MultimodalProcessorOutput:
++        if any(self._is_preprocessed_input(item) for item in image_data):
++            raise ValueError(
++                "Kimi-K3 video requests do not accept preprocessed image inputs."
++            )
++        order = resolve_visual_order(
++            getattr(request_obj, "modalities", None), len(image_data), len(video_data)
++        )
++
++        if isinstance(input_text, (list, torch.Tensor)):
++            original_ids = input_text
++        else:
++            original_ids = _encode_k3_special_tokens(self._tokenizer, input_text)
++        if isinstance(original_ids, torch.Tensor):
++            original_ids = original_ids.flatten().tolist()
++        original_ids = [int(token) for token in original_ids]
++        image_token_id = self.mm_tokens.image_token_id
++        placeholder_count = sum(1 for token in original_ids if token == image_token_id)
++        if placeholder_count != len(order):
++            raise ValueError(
++                "Kimi visual placeholders must map one-to-one to source media: "
++                f"expected {len(order)} ({len(image_data)} image(s), "
++                f"{len(video_data)} video(s)), found {placeholder_count}"
++            )
++
++        loop = asyncio.get_running_loop()
++        pool = video_executor(envs.SGLANG_KIMI_K3_VIDEO_MAX_CONCURRENCY.get())
++        decode_threads = envs.SGLANG_KIMI_K3_VIDEO_DECODE_THREADS.get()
++        video_config = self.video_config
++        preprocess_config = self._processor.preprocess_config
++        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++
++        def open_and_plan(source):
++            opened = KimiK3OpenedVideo(source, decode_threads=decode_threads)
++            try:
++                plan = plan_video(
++                    opened.width,
++                    opened.height,
++                    opened.num_frames,
++                    opened.fps,
++                    video_config,
++                )
++            except BaseException:
++                opened.close()
++                raise
++            return opened, plan
++
++        def decode_and_preprocess(opened, plan):
++            try:
++                image_scale, image_bias = normalization_tensors(
++                    list(preprocess_config.image_mean),
++                    list(preprocess_config.image_std),
++                    device,
++                )
++                return preprocess_video(
++                    opened, plan, image_scale, image_bias, preprocess_config.patch_size
++                )
++            finally:
++                opened.close()
++
++        # 1. load images and open/plan videos (metadata only) off the loop
++        load_futures = [
++            loop.run_in_executor(
++                self.io_executor,
++                functools.partial(
++                    self._load_single_item,
++                    data,
++                    Modality.IMAGE,
++                    discard_alpha_channel=False,
++                ),
++            )
++            for data in image_data
++        ] + [loop.run_in_executor(pool, open_and_plan, source) for source in video_data]
++        results = await asyncio.gather(*load_futures, return_exceptions=True)
++        loaded_images = results[: len(image_data)]
++        opened_videos = results[len(image_data) :]
++        videos = [r for r in opened_videos if not isinstance(r, BaseException)]
++        handed_off = False
++        try:
++            error = next((r for r in results if isinstance(r, BaseException)), None)
++            if error is not None:
++                raise error
++
++            # 2. reject over-budget requests before decoding any frame
++            check_video_limits([plan for _, plan in videos], self.video_limits)
++
++            # 3. decode + preprocess; each video worker closes its decoder
++            futures = []
++            if image_data:
++                futures.append(
++                    loop.run_in_executor(
++                        self.io_executor,
++                        self._preprocess_images_for_video_request,
++                        loaded_images,
++                        device,
++                    )
++                )
++            futures.extend(
++                loop.run_in_executor(pool, decode_and_preprocess, opened, plan)
++                for opened, plan in videos
++            )
++            handed_off = True
++            outputs = await asyncio.gather(*futures)
++        finally:
++            if not handed_off:
++                for opened, _ in videos:
++                    opened.close()
++
++        if image_data:
++            image_features, image_sizes, image_configs, image_grids = outputs[0]
++            video_outputs = outputs[1:]
++        else:
++            image_features = image_sizes = image_configs = image_grids = []
++            video_outputs = outputs
++
++        # 4. expand placeholders in prompt order and build one item per grid
++        tokenizer = self._tokenizer
++        fingerprint = self._kimi_config_fingerprint()
++        skip_hash = envs.SGLANG_MM_SKIP_COMPUTE_HASH.get()
++        media_end_ids = _encode_k3_special_tokens(tokenizer, MEDIA_END)
++        input_ids: List[int] = []
++        items: List[MultimodalDataItem] = []
++
++        def append_item(prefix, suffix, num_tokens, feature, grid, identity):
++            if prefix:
++                input_ids.extend(_encode_k3_special_tokens(tokenizer, prefix))
++            start = len(input_ids)
++            input_ids.extend([image_token_id] * num_tokens)
++            if suffix == MEDIA_END:
++                input_ids.extend(media_end_ids)
++            elif suffix:
++                input_ids.extend(_encode_k3_special_tokens(tokenizer, suffix))
++            item = MultimodalDataItem(
++                modality=Modality.IMAGE,
++                feature=feature,
++                offsets=[(start, start + num_tokens - 1)],
++                model_specific_data={
++                    "image_grid_thw": torch.tensor([grid], dtype=torch.int64)
++                },
++            )
++            if identity is not None:
++                item.set_identity(identity)
++            if self.keep_mm_features_on_device:
++                item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (
++                    True
++                )
++            items.append(item)
++
++        image_index = 0
++        video_index = 0
++        source_index = 0
++        for token in original_ids:
++            if token != image_token_id:
++                input_ids.append(token)
++                continue
++            if order[source_index] == "image":
++                width, height = image_sizes[image_index]
++                grid = image_grids[image_index]
++                identity = (
++                    None
++                    if skip_hash
++                    else kimi_image_identity(
++                        self.kimi_content_config_digest(loaded_images[image_index]),
++                        grid,
++                    )
++                )
++                append_item(
++                    f"<|media_begin|>image {width}x{height}<|media_content|>",
++                    MEDIA_END,
++                    int(image_configs[image_index]["num_tokens"]),
++                    image_features[image_index],
++                    grid,
++                    identity,
++                )
++                image_index += 1
++            else:
++                opened, plan = videos[video_index]
++                for chunk_index, (chunk, (feature, grid)) in enumerate(
++                    zip(plan.chunks, video_outputs[video_index], strict=True)
++                ):
++                    identity = (
++                        None
++                        if skip_hash
++                        else kimi_image_identity(
++                            build_artifact_key(
++                                chunk_content_digest(opened, chunk, video_config),
++                                modality="video",
++                                processor_fingerprint=fingerprint,
++                            ),
++                            grid,
++                        )
++                    )
++                    prefix, suffix = chunk_prompt_parts(
++                        chunk_index, plan, video_config.prompt_format
++                    )
++                    append_item(
++                        prefix,
++                        suffix,
++                        chunk.num_tokens,
++                        feature,
++                        grid,
++                        identity,
++                    )
++                video_index += 1
++            source_index += 1
++
++        self._precompute_hashes_before_cpu_transfer(items)
++        return MultimodalProcessorOutput(
++            input_ids=input_ids,
++            mm_items=self._prepare_mm_items_for_transport(items),
++            im_token_id=image_token_id,
++        )
++
+     def kimi_content_config_digest(self, media) -> str:
+         self._kimi_config_fingerprint()
+         digest = (
+@@ -735,9 +1016,18 @@ class KimiK3ImageProcessor(
+         *args,
+         **kwargs,
+     ):
+-        if request_obj.video_data or kwargs.get("audio_data"):
++        if kwargs.get("audio_data"):
++            raise ValueError("Kimi-K3 supports image and video input only")
++        video_data = list(getattr(request_obj, "video_data", None) or [])
++        if video_data and not envs.SGLANG_KIMI_K3_VIDEO_ENABLE.get():
+             raise ValueError("Kimi-K3 supports image input only")
+         self.reject_caller_image_identity(image_data, request_obj)
++        if video_data:
++            # Video requests take their own uncached path; image-only requests
++            # below are unchanged.
++            return await self._process_mm_data_with_video(
++                list(image_data or []), video_data, input_text, request_obj
++            )
+ 
+         expected_image_count = len(image_data or [])
+         placeholder_count = self.count_image_placeholders(
+diff --git a/python/sglang/srt/multimodal/processors/kimi_k3_video.py b/python/sglang/srt/multimodal/processors/kimi_k3_video.py
+new file mode 100644
+index 0000000..6aa50ef
+--- /dev/null
++++ b/python/sglang/srt/multimodal/processors/kimi_k3_video.py
+@@ -0,0 +1,525 @@
++"""Kimi-K3 video input (K2.5-style temporal chunks, Moonshot-matched framing).
++
++K3's public processor is image-only, but its vision tower keeps the K2.5
++temporal path (learned time embedding for up to 4 frames, temporal mean-pool
++in the patch merger) and its ``preprocessor_config.json`` ships the K2.5 video
++settings. Defaults (``patch_budget="frames"``, ``prompt_format="moonshot"``)
++reproduce Moonshot's own K3 / K3.1 API token-for-token; they were calibrated
++against ``usage.prompt_tokens`` from that API over 15 clips (1-40
++chunks, 99x77 .. 3840x2160, 10/24/30 fps, 0.4-33 s), all exact:
++
++1. every frame gets the same NaViT resize, limited only by
++   ``in_patch_limit_each_frame`` (16384 patches);
++2. sample ``n = max(round(num_frames * min(sample_fps, fps) / fps), 1)``
++   frames, capped at ``in_patch_limit_video // (ceil(w'/14) * ceil(h'/14))``
++   (``w', h'`` = resized frame) -- the video budget limits the frame count,
++   never the resolution; indices are ``linspace`` over the whole clip;
++3. group frames into chunks of ``temporal_merge_kernel_size`` (4); each chunk
++   is one MoonViT grid ``(t, h, w)`` and costs ``h * w / merge**2`` tokens
++   (time is pooled away);
++4. prompt (``moonshot``): one header for the whole video carrying the
++   original size, then the chunk start time before each chunk's tokens::
++
++       <|media_begin|>video {W}x{H}<|media_content|>{ts0}<pad..>{ts1}<pad..><|media_end|>
++
++Token counts cannot tell whether a timestamp sits before or after its chunk
++(before is used, as in K2.5), nor which frames are picked when the cap binds
++(linspace is used).
++
++Alternatives kept for experiments: ``patch_budget`` ``chunk`` (K2.5 code:
++per-frame limit ``min(each_frame, video_limit / len(chunk))``) and ``video``
++(``video_limit / sampled_frames``, shrinks resolution); ``prompt_format``
++``k25`` (``{ts}<|media_begin|>video<|media_content|>…<|media_end|>`` per
++chunk), ``sized`` (same with ``video {W}x{H}``), ``ts_in_header``
++(``<|media_begin|>video {ts}<|media_content|>…`` per chunk).
++"""
++
++from __future__ import annotations
++
++import concurrent.futures
++import hashlib
++import json
++import logging
++import math
++import threading
++from dataclasses import dataclass
++from datetime import datetime, timezone
++from typing import Any, List, Optional, Sequence, Tuple
++
++import numpy as np
++import torch
++
++from sglang.kernels.ops.mm.process import normalize_and_patchify
++from sglang.srt.multimodal.processors.kimi_k25 import (
++    _resize_bicubic_if_needed,
++    navit_resize_config,
++)
++
++logger = logging.getLogger(__name__)
++
++VIDEO_PROMPT_FORMATS = ("moonshot", "k25", "sized", "ts_in_header")
++PATCH_BUDGET_MODES = ("frames", "chunk", "video")
++TIMESTAMP_MODES = ("hh:mm:ss.fff", "mm:ss.fff", "mm:ss")
++MEDIA_END = "<|media_end|>"
++_CHUNK_IDENTITY_TAG = b"sglang-kimi-k3-video-chunk-v1"
++
++
++@dataclass(frozen=True)
++class KimiK3VideoConfig:
++    """Checkpoint video settings plus the serving-side knobs."""
++
++    sample_fps: float
++    temporal_merge_kernel_size: int
++    in_patch_limit_each_frame: int
++    in_patch_limit_video: Optional[int]
++    max_num_frames_each_video: Optional[int]
++    timestamp_mode: str
++    patch_size: int
++    merge_kernel_size: int
++    patch_limit_on_one_side: int
++    fixed_output_tokens: Optional[int]
++    prompt_format: str = "moonshot"
++    patch_budget: str = "frames"
++
++    @classmethod
++    def from_media_proc_cfg(
++        cls, cfg: dict, *, prompt_format: str, patch_budget: str
++    ) -> "KimiK3VideoConfig":
++        if prompt_format not in VIDEO_PROMPT_FORMATS:
++            raise ValueError(
++                f"Unknown Kimi-K3 video prompt format {prompt_format!r}; "
++                f"expected one of {VIDEO_PROMPT_FORMATS}"
++            )
++        if patch_budget not in PATCH_BUDGET_MODES:
++            raise ValueError(
++                f"Unknown Kimi-K3 video patch budget {patch_budget!r}; "
++                f"expected one of {PATCH_BUDGET_MODES}"
++            )
++        timestamp_mode = cfg.get("timestamp_mode") or "hh:mm:ss.fff"
++        if timestamp_mode not in TIMESTAMP_MODES:
++            raise ValueError(f"Invalid Kimi-K3 timestamp mode: {timestamp_mode}")
++        temporal = int(cfg.get("temporal_merge_kernel_size") or 4)
++        if not 1 <= temporal <= 4:
++            # The tower's learned time embedding covers 4 frames.
++            raise ValueError(
++                f"Kimi-K3 temporal_merge_kernel_size must be in [1, 4], got {temporal}"
++            )
++        each_frame = cfg.get("in_patch_limit_each_frame")
++        if each_frame is None:
++            each_frame = cfg["in_patch_limit"]
++        video_limit = cfg.get("in_patch_limit_video")
++        max_frames = cfg.get("max_num_frames_each_video")
++        fixed = cfg.get("fixed_output_tokens")
++        return cls(
++            sample_fps=float(cfg.get("sample_fps") or 8.0),
++            temporal_merge_kernel_size=temporal,
++            in_patch_limit_each_frame=int(each_frame),
++            in_patch_limit_video=None if video_limit is None else int(video_limit),
++            max_num_frames_each_video=None if max_frames is None else int(max_frames),
++            timestamp_mode=timestamp_mode,
++            patch_size=int(cfg["patch_size"]),
++            merge_kernel_size=int(cfg["merge_kernel_size"]),
++            patch_limit_on_one_side=int(cfg["patch_limit_on_one_side"]),
++            fixed_output_tokens=None if fixed is None else int(fixed),
++            prompt_format=prompt_format,
++            patch_budget=patch_budget,
++        )
++
++    def fingerprint(self) -> dict:
++        return {
++            "sample_fps": self.sample_fps,
++            "temporal_merge_kernel_size": self.temporal_merge_kernel_size,
++            "in_patch_limit_each_frame": self.in_patch_limit_each_frame,
++            "in_patch_limit_video": self.in_patch_limit_video,
++            "max_num_frames_each_video": self.max_num_frames_each_video,
++            "patch_budget": self.patch_budget,
++        }
++
++
++@dataclass(frozen=True)
++class KimiK3VideoLimits:
++    """Per-request guards; 0 disables a limit."""
++
++    max_duration_s: float = 0.0
++    max_sampled_frames: int = 0
++    max_video_tokens: int = 0
++
++
++def timestamp_as_str(timestamp: float, timestamp_mode: str = "hh:mm:ss.fff") -> str:
++    """Same rendering as K2.5 ``media_utils.timestamp_as_str``."""
++    clock = datetime.fromtimestamp(timestamp, tz=timezone.utc)
++    if timestamp_mode == "hh:mm:ss.fff":
++        return clock.strftime("%H:%M:%S") + f".{int((timestamp % 1) * 1000):03d}"
++    if timestamp_mode == "mm:ss.fff":
++        return clock.strftime("%M:%S") + f".{int((timestamp % 1) * 1000):03d}"
++    if timestamp_mode == "mm:ss":
++        return clock.strftime("%M:%S")
++    raise ValueError(f"Invalid timestamp mode: {timestamp_mode}")
++
++
++@dataclass(frozen=True)
++class KimiK3VideoChunk:
++    frame_indices: Tuple[int, ...]
++    timestamp_text: str
++    resize_config: dict
++
++    @property
++    def num_tokens(self) -> int:
++        return int(self.resize_config["num_tokens"])
++
++    def grid_thw(self, patch_size: int) -> Tuple[int, int, int]:
++        height = self.resize_config["new_height"] + self.resize_config["pad_height"]
++        width = self.resize_config["new_width"] + self.resize_config["pad_width"]
++        return len(self.frame_indices), height // patch_size, width // patch_size
++
++
++@dataclass(frozen=True)
++class KimiK3VideoPlan:
++    width: int
++    height: int
++    num_frames: int
++    fps: float
++    chunks: Tuple[KimiK3VideoChunk, ...]
++
++    @property
++    def duration_s(self) -> float:
++        return self.num_frames / self.fps
++
++    @property
++    def num_sampled_frames(self) -> int:
++        return sum(len(chunk.frame_indices) for chunk in self.chunks)
++
++    @property
++    def num_tokens(self) -> int:
++        return sum(chunk.num_tokens for chunk in self.chunks)
++
++
++def plan_video(
++    width: int, height: int, num_frames: int, fps: float, cfg: KimiK3VideoConfig
++) -> KimiK3VideoPlan:
++    """Frame sampling, chunking and per-chunk resize, from metadata only."""
++    if num_frames <= 0:
++        raise ValueError("Kimi-K3 video input must contain at least one frame.")
++    if not fps or fps <= 0:
++        raise ValueError("Kimi-K3 video input must report a positive frame rate.")
++    if width <= 0 or height <= 0:
++        raise ValueError("Kimi-K3 video input has invalid frame dimensions.")
++
++    def resize_for(per_frame_limit: int) -> dict:
++        return navit_resize_config(
++            width,
++            height,
++            cfg.patch_size,
++            cfg.merge_kernel_size,
++            max(1, per_frame_limit),
++            cfg.patch_limit_on_one_side,
++            cfg.fixed_output_tokens,
++        )
++
++    # K2.5 split_video_chunks
++    sample_fps = min(cfg.sample_fps, fps)
++    sampled = max(round(num_frames * sample_fps / fps), 1)
++    if cfg.max_num_frames_each_video is not None:
++        sampled = min(sampled, max(1, cfg.max_num_frames_each_video))
++
++    frame_resize = None
++    if cfg.patch_budget == "frames":
++        # Moonshot: full per-frame resolution; the video budget caps how many
++        # frames are sampled, counting ceil-covered patches of the resized frame.
++        frame_resize = resize_for(cfg.in_patch_limit_each_frame)
++        if cfg.in_patch_limit_video is not None:
++            patches_per_frame = math.ceil(
++                frame_resize["new_width"] / cfg.patch_size
++            ) * math.ceil(frame_resize["new_height"] / cfg.patch_size)
++            sampled = min(
++                sampled, max(1, cfg.in_patch_limit_video // patches_per_frame)
++            )
++    frame_indices = (
++        np.linspace(0, num_frames - 1, sampled).round().astype(int).tolist()
++    )
++
++    kernel = cfg.temporal_merge_kernel_size
++    chunks = []
++    for start in range(0, len(frame_indices), kernel):
++        indices = tuple(frame_indices[start : start + kernel])
++        if frame_resize is not None:
++            resize_config = frame_resize
++        else:
++            # K2.5 get_resize_config(video_chunk) -> navit_resize_video
++            budget_frames = len(indices) if cfg.patch_budget == "chunk" else sampled
++            per_frame_limit = cfg.in_patch_limit_each_frame
++            if cfg.in_patch_limit_video is not None:
++                per_frame_limit = min(
++                    round(cfg.in_patch_limit_video / budget_frames), per_frame_limit
++                )
++            resize_config = resize_for(per_frame_limit)
++        chunks.append(
++            KimiK3VideoChunk(
++                frame_indices=indices,
++                timestamp_text=timestamp_as_str(
++                    indices[0] / float(fps), cfg.timestamp_mode
++                ),
++                resize_config=resize_config,
++            )
++        )
++    return KimiK3VideoPlan(
++        width=int(width),
++        height=int(height),
++        num_frames=int(num_frames),
++        fps=float(fps),
++        chunks=tuple(chunks),
++    )
++
++
++def check_video_limits(
++    plans: Sequence[KimiK3VideoPlan], limits: KimiK3VideoLimits
++) -> None:
++    """Reject over-budget requests before any frame is decoded (-> HTTP 400)."""
++    for plan in plans:
++        if limits.max_duration_s and plan.duration_s > limits.max_duration_s:
++            raise ValueError(
++                f"Video is {plan.duration_s:.1f}s long; Kimi-K3 video input is "
++                f"limited to {limits.max_duration_s:g}s per video."
++            )
++        if (
++            limits.max_sampled_frames
++            and plan.num_sampled_frames > limits.max_sampled_frames
++        ):
++            raise ValueError(
++                f"Video samples {plan.num_sampled_frames} frames; Kimi-K3 video "
++                f"input is limited to {limits.max_sampled_frames} frames per video."
++            )
++    total_tokens = sum(plan.num_tokens for plan in plans)
++    if limits.max_video_tokens and total_tokens > limits.max_video_tokens:
++        raise ValueError(
++            f"Video input needs {total_tokens} visual tokens; Kimi-K3 video input "
++            f"is limited to {limits.max_video_tokens} tokens per request."
++        )
++
++
++def chunk_prompt_parts(
++    index: int, plan: KimiK3VideoPlan, prompt_format: str
++) -> Tuple[str, str]:
++    """``(prefix, suffix)`` control text around chunk ``index``'s media tokens."""
++    chunk = plan.chunks[index]
++    ts = chunk.timestamp_text
++    if prompt_format == "moonshot":
++        prefix = ts
++        if index == 0:
++            header = f"<|media_begin|>video {plan.width}x{plan.height}<|media_content|>"
++            prefix = header + ts
++        suffix = MEDIA_END if index == len(plan.chunks) - 1 else ""
++        return prefix, suffix
++    if prompt_format == "k25":
++        return f"{ts}<|media_begin|>video<|media_content|>", MEDIA_END
++    if prompt_format == "sized":
++        return (
++            f"{ts}<|media_begin|>video {plan.width}x{plan.height}<|media_content|>",
++            MEDIA_END,
++        )
++    if prompt_format == "ts_in_header":
++        return f"<|media_begin|>video {ts}<|media_content|>", MEDIA_END
++    raise ValueError(f"Unknown Kimi-K3 video prompt format {prompt_format!r}")
++
++
++# ---------------------------------------------------------------------------
++# Decoding
++# ---------------------------------------------------------------------------
++
++
++class KimiK3OpenedVideo:
++    """An opened clip: encoded-bytes digest, decoder and metadata."""
++
++    def __init__(self, source: Any, decode_threads: int = 1):
++        from sglang.srt.utils.common import get_video_bytes
++        from sglang.srt.utils.video_decoder import VideoDecoderWrapper
++
++        data = get_video_bytes(source)
++        if not data:
++            raise ValueError("Kimi-K3 video input is empty.")
++        self.content_sha256 = hashlib.sha256(data).hexdigest()
++        try:
++            # CPU decode: keep frame buffers out of GPU memory in the
++            # tokenizer process; preprocessing moves only sampled frames.
++            self.decoder = VideoDecoderWrapper(
++                data, device="cpu", num_decode_threads=decode_threads
++            )
++            self.num_frames = int(len(self.decoder))
++            self.fps = float(self.decoder.avg_fps or 0.0)
++            height, width = self.decoder.frame_shape
++        except (ImportError, MemoryError):
++            self.close()
++            raise
++        except ValueError:
++            self.close()
++            raise
++        except Exception as error:
++            self.close()
++            raise ValueError(f"Could not decode video: {error}") from error
++        self.width, self.height = int(width), int(height)
++
++    def get_frames(self, indices: Sequence[int]) -> torch.Tensor:
++        """Decode ``indices`` as a ``(N, H, W, C)`` uint8 CPU tensor."""
++        try:
++            frames = self.decoder.get_frames_at(list(indices))
++        except Exception as error:
++            raise ValueError(f"Could not decode video frames: {error}") from error
++        if isinstance(frames, np.ndarray):
++            frames = torch.from_numpy(np.ascontiguousarray(frames))
++        frames = frames.cpu()
++        if frames.dim() != 4 or frames.dtype != torch.uint8:
++            raise ValueError(
++                f"Unexpected decoded video frames {tuple(frames.shape)} {frames.dtype}"
++            )
++        return frames
++
++    def close(self) -> None:
++        decoder = getattr(self, "decoder", None)
++        self.decoder = None
++        if decoder is not None:
++            decoder.close()  # also removes decord's temp file
++
++
++def chunk_content_digest(
++    opened: KimiK3OpenedVideo, chunk: KimiK3VideoChunk, cfg: KimiK3VideoConfig
++) -> str:
++    """``sha256:`` digest of what one chunk's pixels depend on."""
++    hasher = hashlib.sha256(_CHUNK_IDENTITY_TAG)
++    hasher.update(bytes.fromhex(opened.content_sha256))
++    hasher.update(
++        json.dumps(
++            {
++                "frames": list(chunk.frame_indices),
++                "resize": chunk.resize_config,
++                "cfg": cfg.fingerprint(),
++            },
++            sort_keys=True,
++        ).encode()
++    )
++    return "sha256:" + hasher.hexdigest()
++
++
++# ---------------------------------------------------------------------------
++# Pixel preprocessing
++# ---------------------------------------------------------------------------
++
++
++def _frames_to_nchw_rgb(frames: torch.Tensor, device: torch.device) -> torch.Tensor:
++    channels = frames.shape[-1]
++    if channels == 1:
++        frames = frames.expand(-1, -1, -1, 3)
++    elif channels == 4:
++        frames = frames[..., :3]
++    elif channels != 3:
++        raise ValueError(f"Unsupported video frame channel count: {channels}")
++    return frames.to(device, non_blocking=True).permute(0, 3, 1, 2).contiguous()
++
++
++def preprocess_chunk_frames(
++    frames: torch.Tensor,
++    chunk: KimiK3VideoChunk,
++    image_scale: torch.Tensor,
++    image_bias: torch.Tensor,
++    patch_size: int,
++) -> Tuple[torch.Tensor, Tuple[int, int, int]]:
++    """Resize/pad/normalize/patchify one chunk, frame-major like K2.5.
++
++    K2.5 stacks the chunk's frames to ``(t, H, W, C)`` and ``navit_patchify``
++    flattens them time-major, which equals per-frame patchify concatenated in
++    frame order. Resize is the same antialiased bicubic as SGLang's K3 image
++    path (tracks PIL ``BICUBIC``).
++    """
++    config = chunk.resize_config
++    new_h, new_w = config["new_height"], config["new_width"]
++    padded_h = new_h + config["pad_height"]
++    padded_w = new_w + config["pad_width"]
++    x = _frames_to_nchw_rgb(frames, image_scale.device)
++    x = _resize_bicubic_if_needed(x, new_h, new_w)
++    patches = normalize_and_patchify(
++        x.contiguous(), image_scale, image_bias, patch_size, padded_h, padded_w
++    )
++    t = frames.shape[0]
++    patches = patches.reshape(-1, *patches.shape[-3:])
++    grid = (t, padded_h // patch_size, padded_w // patch_size)
++    if patches.shape[0] != grid[0] * grid[1] * grid[2]:
++        raise ValueError("Kimi-K3 video chunk patch count does not match its grid")
++    return patches, grid
++
++
++def preprocess_video(
++    opened: KimiK3OpenedVideo,
++    plan: KimiK3VideoPlan,
++    image_scale: torch.Tensor,
++    image_bias: torch.Tensor,
++    patch_size: int,
++) -> List[Tuple[torch.Tensor, Tuple[int, int, int]]]:
++    """Decode and preprocess chunk by chunk to bound peak frame memory."""
++    outputs = []
++    with torch.inference_mode():
++        for chunk in plan.chunks:
++            frames = opened.get_frames(chunk.frame_indices)
++            if frames.shape[0] != len(chunk.frame_indices):
++                raise ValueError("Video decoder returned the wrong number of frames")
++            if (frames.shape[2], frames.shape[1]) != (plan.width, plan.height):
++                raise ValueError(
++                    "Kimi-K3 video frames must keep one resolution for the whole clip"
++                )
++            patches, grid = preprocess_chunk_frames(
++                frames, chunk, image_scale, image_bias, patch_size
++            )
++            expected = chunk.grid_thw(patch_size)
++            if grid != expected:
++                raise ValueError(
++                    f"Kimi-K3 video chunk grid {grid} != planned grid {expected}"
++                )
++            outputs.append((patches, grid))
++    return outputs
++
++
++# ---------------------------------------------------------------------------
++# Bounded executor for decode + preprocess (off the tokenizer event loop)
++# ---------------------------------------------------------------------------
++
++_executor_lock = threading.Lock()
++_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
++
++
++def video_executor(max_workers: int) -> concurrent.futures.ThreadPoolExecutor:
++    """Process-wide pool; its size bounds concurrent video decodes."""
++    global _executor
++    with _executor_lock:
++        if _executor is None:
++            _executor = concurrent.futures.ThreadPoolExecutor(
++                max_workers=max(1, max_workers),
++                thread_name_prefix="kimi-k3-video",
++            )
++        return _executor
++
++
++def resolve_visual_order(
++    modalities: Optional[Sequence[Any]], image_count: int, video_count: int
++) -> List[str]:
++    """Order of image/video sources as they appear in the prompt.
++
++    The K3 chat path records one modality per media part in message order
++    (``serving_chat._kimi_k3_media_order``); ``/generate`` callers that mix
++    images and videos must pass ``modalities`` themselves.
++    """
++    flat: List[str] = []
++    for modality in modalities or []:
++        values = modality if isinstance(modality, (list, tuple)) else [modality]
++        for value in values:
++            if value in ("image", "multi-images"):
++                flat.append("image")
++            elif value == "video":
++                flat.append("video")
++            elif value is not None:
++                raise ValueError(f"Unsupported Kimi-K3 media modality: {value!r}")
++    if flat.count("image") == image_count and flat.count("video") == video_count:
++        return flat
++    if image_count == 0 or video_count == 0:
++        return ["image"] * image_count + ["video"] * video_count
++    raise ValueError(
++        "Kimi-K3 requests that mix images and videos must state the media order "
++        "in `modalities` (one entry per image/video, in prompt order)."
++    )
